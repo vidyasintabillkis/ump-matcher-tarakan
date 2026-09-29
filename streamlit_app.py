@@ -40,6 +40,7 @@ name_score_min = 72
 amount_tol_rp = 2000
 amount_tol_pct = 0.003
 anomali_min_nominal = 10000
+max_order_combo = 5
 
 # Pengaturan (Opsional)
 with st.expander("⚙️ Pengaturan Matching", expanded=False):
@@ -52,6 +53,10 @@ with st.expander("⚙️ Pengaturan Matching", expanded=False):
         amount_tol_pct = st.slider("Toleransi Nominal (%)", min_value=0.0, max_value=2.0, value=0.3, step=0.1) / 100.0
     with col_p3:
         anomali_min_nominal = st.number_input("Batas Anomali (Rp)", min_value=0, max_value=100000, value=10000, step=5000)
+        max_order_combo = st.slider(
+            "Maks. Order per 1 Pembayaran", min_value=2, max_value=6, value=5, step=1,
+            help="Kalau 1 UMP dipakai bayar beberapa order sekaligus, berapa order maksimal yang dicoba digabung."
+        )
 
 cfg = {
     'DATE_WINDOW_DAYS': date_window,
@@ -59,7 +64,7 @@ cfg = {
     'AMOUNT_TOL_PCT': amount_tol_pct,
     'NAME_SCORE_MIN': name_score_min,
     'NAME_SCORE_UNIQUE_OVERRIDE': 90,
-    'MAX_ORDER_COMBO': 5,
+    'MAX_ORDER_COMBO': max_order_combo,
     'MAX_UMP_COMBO': 4,
     'NOMINAL_UMUM_FREQ_THRESHOLD': 15,
     'NOMINAL_UMUM_DATE_THRESHOLD': 5,
@@ -126,7 +131,7 @@ if 'results' in st.session_state:
     with col_f1:
         conf_filter = st.selectbox(
             "Filter Confidence",
-            ["Semua", "≥75%", "55–74%", "1–54%", "0%"]
+            ["Semua", "≥75%", "55–74%", "1–54%", "0%", "Bayar >1 Order"]
         )
     with col_f2:
         search_kw = st.text_input("Cari", placeholder="Nama, no order, bukti...")
@@ -140,6 +145,8 @@ if 'results' in st.session_state:
         df_filtered = df_filtered[(df_filtered['confidence'] > 0) & (df_filtered['confidence'] < 55)]
     elif conf_filter == "0%":
         df_filtered = df_filtered[df_filtered['confidence'] == 0]
+    elif conf_filter == "Bayar >1 Order":
+        df_filtered = df_filtered[df_filtered['jumlah_order'] > 1]
 
     if search_kw.strip():
         kw = search_kw.strip().lower()
@@ -162,8 +169,22 @@ if 'results' in st.session_state:
             'confidence': 'Confidence (%)', 'sumber': 'Sumber Kecocokan',
             'tipe': 'Tipe Kecocokan', 'bentuk_oc': 'Bentuk / No OC Kontrak',
             'kandidat_lain': 'Kandidat Alternatif', 'catatan': 'Catatan',
-        })
+            'jumlah_order': 'Jumlah Order', 'rincian_order': 'Rincian Order (Bayar Banyak Order)',
+        }).drop(columns=['rincian_items', 'is_anomali'], errors='ignore')
         df_export.to_excel(writer, index=False, sheet_name='Hasil Matching UMP')
+
+        # Sheet rincian: 1 baris per order untuk UMP yang membayar banyak order
+        rows_rincian = []
+        for r in results:
+            for ono, val in r.get('rincian_items') or []:
+                rows_rincian.append({
+                    'No Urut UMP': r['no_urut'], 'Nama Penyetor (UMP)': r['nama_ump'],
+                    'No Bukti UMP': r['no_bukti'], 'Nominal UMP (Rp)': r['nominal_ump'],
+                    'Nomor Order': ono, 'Nilai Order yang Dibayar (Rp)': val,
+                    'Confidence (%)': r['confidence'],
+                })
+        if rows_rincian:
+            pd.DataFrame(rows_rincian).to_excel(writer, index=False, sheet_name='Rincian Bayar Banyak Order')
 
     with col_dl:
         st.write("")
@@ -179,7 +200,7 @@ if 'results' in st.session_state:
     st.caption(f"{len(df_filtered)} dari {n_total} transaksi")
     df_view = df_filtered[[
         'no_urut', 'nama_ump', 'tanggal_ump', 'no_bukti', 'nominal_ump',
-        'confidence', 'order_no', 'customer_order', 'sumber'
+        'confidence', 'order_no', 'jumlah_order', 'customer_order', 'sumber'
     ]].copy()
     df_view['nominal_ump']  = df_view['nominal_ump'].apply(lambda v: f"Rp{v:,.0f}" if pd.notnull(v) else "-")
     df_view['confidence']   = df_view['confidence'].apply(lambda c: f"{c}%")
@@ -187,7 +208,7 @@ if 'results' in st.session_state:
     df_view = df_view.rename(columns={
         'no_urut': 'No', 'nama_ump': 'Nama Penyetor', 'tanggal_ump': 'Tanggal',
         'no_bukti': 'No Bukti', 'nominal_ump': 'Nominal (Rp)',
-        'confidence': 'Confidence', 'order_no': 'Order Kandidat',
+        'confidence': 'Confidence', 'order_no': 'Order Kandidat', 'jumlah_order': 'Jml Order',
         'customer_order': 'Customer', 'sumber': 'Metode'
     })
     st.dataframe(df_view, use_container_width=True, hide_index=True, height=430)
@@ -231,6 +252,13 @@ if 'results' in st.session_state:
             selisih = item['selisih_hari'] if pd.notnull(item['selisih_hari']) else '-'
             st.write(f"Selisih: {selisih} hari")
             st.write(f"Metode: {item['sumber'] or '—'}")
+            if item['jumlah_order'] > 1:
+                st.info(f"1 UMP ini dipakai bayar **{item['jumlah_order']} order** sekaligus")
+                st.dataframe(
+                    pd.DataFrame(item['rincian_items'], columns=['Nomor Order', 'Nilai (Rp)']),
+                    hide_index=True, use_container_width=True,
+                    column_config={'Nilai (Rp)': st.column_config.NumberColumn(format="Rp%d")},
+                )
             if item['bentuk_oc']:
                 st.write(f"Perikatan/OC: {item['bentuk_oc']}")
             if item['catatan']:
