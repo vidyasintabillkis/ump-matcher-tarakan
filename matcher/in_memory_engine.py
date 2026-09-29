@@ -221,6 +221,7 @@ class InMemoryMatchingEngine:
         self.name_score_unique_override = cfg.get('NAME_SCORE_UNIQUE_OVERRIDE', 90)
         self.max_order_combo = cfg.get('MAX_ORDER_COMBO', 5)
         self.max_ump_combo = cfg.get('MAX_UMP_COMBO', 4)
+        self.combo_pool_size = cfg.get('ORDER_COMBO_POOL', 15)
         self.freq_threshold = cfg.get('NOMINAL_UMUM_FREQ_THRESHOLD', 15)
         self.freq_date_threshold = cfg.get('NOMINAL_UMUM_DATE_THRESHOLD', 5)
 
@@ -257,8 +258,63 @@ class InMemoryMatchingEngine:
         distinctive = [bw for aw, bw in matched_pairs if len(self.word_to_custs.get(bw, set())) == 1]
         return len(distinctive) >= 1 or len(matched_pairs) >= 2
 
+    def _order_combo_candidates(self, ump, matched):
+        """Cari kombinasi 2..N order yang jumlahnya = nominal 1 UMP.
+
+        - Grup per customer (satu nama customer).
+        - Grup gabungan lintas customer, untuk kasus nama customer yang sama
+          tercatat dengan ejaan berbeda (kena penalti skor tambahan).
+        """
+        target = float(ump['nominal'])
+        out, seen = [], set()
+        score_of = {cn: ns for cn, ns, _ in matched}
+
+        groups = [(orders, False) for _, _, orders in matched]
+        if len(matched) > 1:
+            groups.append(([o for _, _, orders in matched for o in orders], True))
+
+        for group_orders, cross in groups:
+            if len(group_orders) < 2:
+                continue
+            pool = sorted(group_orders, key=lambda o: date_delta(o['date'], ump['tanggal']))[:self.combo_pool_size]
+            for k in range(2, min(self.max_order_combo, len(pool)) + 1):
+                for combo in combinations(pool, k):
+                    combo = sorted(combo, key=lambda o: o['order_no'])
+                    if cross and len({o['customer_norm'] for o in combo}) < 2:
+                        continue  # combo 1 customer sudah dicek di grup per-customer
+                    key = tuple(sorted(o['order_no'] for o in combo))
+                    fee_sum = sum(o['total_fee'] for o in combo)
+                    ppn_sum = sum(o['total_ppn'] for o in combo)
+                    for adj, val in candidate_values(fee_sum, ppn_sum).items():
+                        if not self.close(val, target) or (key, adj) in seen:
+                            continue
+                        seen.add((key, adj))
+                        name_score = min(score_of[o['customer_norm']] for o in combo)
+                        dd = max(date_delta(o['date'], ump['tanggal']) for o in combo)
+                        # penalti: makin banyak order digabung makin kecil keyakinannya
+                        base = (name_score - 5 - 3 * (k - 2)
+                                - (0 if adj == 'total(fee+ppn)' else 2)
+                                - (5 if cross else 0))
+                        custs = []
+                        for o in combo:
+                            if o['customer_raw'] not in custs:
+                                custs.append(o['customer_raw'])
+                        out.append({
+                            'orders': [o['order_no'] for o in combo],
+                            'order_customer': ' / '.join(custs),
+                            'order_dates': [o['date'] for o in combo],
+                            'value': val, 'name_score': name_score, 'date_delta': dd,
+                            'type': f'combo{k}', 'adj': adj, 'score': base - dd * 0.25,
+                            'line_no': None, 'bentuk': None, 'oc_no': None,
+                            'cross_customer': cross,
+                            'breakdown': [(o['order_no'], candidate_values(o['total_fee'], o['total_ppn'])[adj])
+                                          for o in combo],
+                        })
+        return out
+
     def match_by_name(self, ump):
         candidates = []
+        matched = []  # (cust_norm, name_score, order_dalam_window)
         name_matches = process.extract(ump['nama_norm'], self.cust_names, scorer=combined_score, limit=5)
 
         for cust_norm, name_score, _ in name_matches:
@@ -270,6 +326,7 @@ class InMemoryMatchingEngine:
             cand_orders = [o for o in self.orders_by_cust.get(cust_norm, []) if self.date_ok(o['date'], ump['tanggal'])]
             if not cand_orders:
                 continue
+            matched.append((cust_norm, name_score, cand_orders))
 
             # Per line
             for o in cand_orders:
@@ -300,26 +357,8 @@ class InMemoryMatchingEngine:
                             'line_no': None, 'bentuk': None, 'oc_no': None,
                         })
 
-            # Multi-order combo
-            if len(cand_orders) > 1:
-                pool_orders = sorted(cand_orders, key=lambda o: date_delta(o['date'], ump['tanggal']))[:15]
-                for k in range(2, min(self.max_order_combo, len(pool_orders)) + 1):
-                    for combo in combinations(pool_orders, k):
-                        fee_sum = sum(o['total_fee'] for o in combo)
-                        ppn_sum = sum(o['total_ppn'] for o in combo)
-                        for adj, val in candidate_values(fee_sum, ppn_sum).items():
-                            if self.close(val, float(ump['nominal'])):
-                                dd = max(date_delta(o['date'], ump['tanggal']) for o in combo)
-                                base = name_score - 5 - (0 if adj == 'total(fee+ppn)' else 2)
-                                score = base - dd * 0.25
-                                candidates.append({
-                                    'orders': [o['order_no'] for o in combo],
-                                    'order_customer': combo[0]['customer_raw'],
-                                    'order_dates': [o['date'] for o in combo],
-                                    'value': val, 'name_score': name_score, 'date_delta': dd,
-                                    'type': f'combo{k}', 'adj': adj, 'score': score,
-                                    'line_no': None, 'bentuk': None, 'oc_no': None,
-                                })
+        # Multi-order combo: 1 pembayaran UMP untuk beberapa order sekaligus
+        candidates.extend(self._order_combo_candidates(ump, matched))
 
         if not candidates:
             # Fallback jika nama sangat kuat dan hanya ada 1 order di window
@@ -462,6 +501,9 @@ class InMemoryMatchingEngine:
                 'bentuk_oc': '',
                 'kandidat_lain': '',
                 'catatan': '',
+                'jumlah_order': 0,
+                'rincian_order': '',
+                'rincian_items': [],
             }
 
             if u['is_anomali']:
@@ -483,6 +525,7 @@ class InMemoryMatchingEngine:
                     'selisih_hari': h['max_date_delta'],
                     'nilai_cocok': h['value_matched'],
                     'confidence': conf,
+                    'jumlah_order': 1,
                     'sumber': 'Gabungan Beberapa UMP',
                     'tipe': 'combo_ump',
                     'catatan': f"GABUNGAN {len(h['ump_combo'])} UMP jadi 1 pembayaran (total Rp{total_gabungan:,.0f}) bersama: {', '.join(other_names)}",
@@ -493,22 +536,39 @@ class InMemoryMatchingEngine:
             kind, cands = per_ump_candidates.get(u['id'], (None, []))
             if kind == 'name' and cands:
                 top = cands[0]
-                alt = ', '.join(', '.join(c['orders']) for c in cands[1:5])
+                alt = ', '.join(' + '.join(c['orders']) for c in cands[1:5])
                 if top['type'] == 'unique_no_amount':
                     conf = clamp(min(top['name_score'] - top['date_delta'] * 0.25, 75))
                     catatan = 'NOMINAL BELUM DICEK - hanya nama+tanggal, cuma 1 order kandidat di window'
                 else:
-                    conf = clamp(top['name_score'] - top['date_delta'] * 0.25)
+                    # combo: pakai skor yang sudah kena penalti jumlah order; lainnya tetap
+                    conf = clamp(top['score'] if top['type'].startswith('combo')
+                                 else top['name_score'] - top['date_delta'] * 0.25)
                     catatan = ''
                 bentuk_info = f"{top.get('bentuk') or ''} {top.get('oc_no') or ''}".strip()
+
+                is_combo = top['type'].startswith('combo')
+                sumber = 'Nama+Nominal'
+                rincian, items = '', []
+                if is_combo:
+                    items = list(top['breakdown'])
+                    rincian = ' + '.join(f"{ono} (Rp{v:,.0f})" for ono, v in items)
+                    sumber = 'Nama+Nominal (Bayar Banyak Order)'
+                    catatan = f"1 UMP dipakai bayar {len(top['orders'])} order sekaligus: {rincian}"
+                    if top.get('cross_customer'):
+                        catatan += ' | Nama customer antar order berbeda ejaan, cek manual'
+
                 res.update({
+                    'jumlah_order': len(top['orders']),
+                    'rincian_order': rincian,
+                    'rincian_items': items,
                     'order_no': ', '.join(top['orders']),
                     'customer_order': top['order_customer'],
                     'tanggal_order': top['order_dates'][0] if top['order_dates'] else None,
                     'selisih_hari': top['date_delta'],
                     'nilai_cocok': top['value'],
                     'confidence': conf,
-                    'sumber': 'Nama+Nominal',
+                    'sumber': sumber,
                     'tipe': f"{top['type']}/{top['adj']}",
                     'bentuk_oc': bentuk_info,
                     'kandidat_lain': alt,
@@ -522,6 +582,7 @@ class InMemoryMatchingEngine:
                     conf = clamp(65 - 5 * (top['freq'] - 1) - top['date_delta'] * 0.15)
                     bentuk_info = f"{top.get('bentuk') or ''} {top.get('oc_no') or ''}".strip()
                     res.update({
+                        'jumlah_order': 1,
                         'order_no': top['order']['order_no'],
                         'customer_order': top['order']['customer_raw'],
                         'tanggal_order': top['order']['date'],
